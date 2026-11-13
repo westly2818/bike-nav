@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bike Nav</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#ffffff;--fg:#1b1b1b;--muted:#5b6470;--card:#f3f4f6;--line:#d1d5db;--acc:#2563eb;--accfg:#fff;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--fg:#e8e8e8;--muted:#9aa4b2;--card:#1c2128;--line:#363d47;--acc:#60a5fa;--accfg:#08111f;--bad:#f97066}}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:1.4rem;margin:0 0 12px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+h2{font-size:1rem;margin:0 0 10px}
+label{display:block;font-size:.85rem;color:var(--muted);margin:8px 0 3px}
+input[type=text]{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+button{padding:10px 14px;border:0;border-radius:8px;background:var(--acc);color:var(--accfg);font:inherit;font-weight:600;cursor:pointer;margin:8px 8px 0 0}
+button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#status{color:var(--muted);font-size:.9rem;margin-top:8px;min-height:1.3em}
+#status.err{color:var(--bad)}
+#now{display:flex;gap:16px;align-items:center}
+#arrow{font-size:3.4rem;line-height:1;width:1.3em;text-align:center}
+#dist{font-size:2rem;font-weight:700}
+#street{color:var(--muted)}
+#map{height:280px;border-radius:10px;border:1px solid var(--line)}
+ol{padding-left:20px;margin:6px 0 0;max-height:220px;overflow:auto}
+li{margin:2px 0;font-size:.92rem}
+.small{font-size:.85rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>Bike Nav &rarr; ESP32 display</h1>
+
+<section>
+  <h2>1. Route</h2>
+  <label for="from">From</label>
+  <input id="from" type="text" value="MG Road, Bengaluru">
+  <label for="to">To</label>
+  <input id="to" type="text" value="Cubbon Park, Bengaluru">
+  <div class="row">
+    <button id="btnMyLoc" class="alt" type="button">Use my location as start</button>
+    <button id="btnRoute" type="button">Find bike route</button>
+  </div>
+  <div id="status"></div>
+</section>
+
+<section>
+  <h2>2. Bluetooth</h2>
+  <div class="row">
+    <button id="btnBle" type="button">Connect to BikeNav</button>
+    <span id="bleState" class="small">Not connected</span>
+  </div>
+  <div class="small" id="bleHint"></div>
+</section>
+
+<section>
+  <h2>3. Navigate</h2>
+  <div class="row">
+    <label><input type="radio" name="mode" value="sim" checked> Simulate (for testing at home)</label>
+    <label><input type="radio" name="mode" value="gps"> Live GPS</label>
+  </div>
+  <label for="speed">Simulated speed: <span id="speedVal">5</span> m/s (x1 = about 18 km/h)</label>
+  <input id="speed" type="range" min="1" max="30" value="5" style="width:100%">
+  <div class="row">
+    <button id="btnStart" type="button" disabled>Start</button>
+    <button id="btnStop" class="alt" type="button" disabled>Stop</button>
+  </div>
+  <div id="now" style="margin-top:12px">
+    <div id="arrow">&middot;</div>
+    <div><div id="dist">--</div><div id="street">No route yet</div></div>
+  </div>
+  <div class="small" id="progress"></div>
+</section>
+
+<section>
+  <h2>Map and steps</h2>
+  <div id="map"></div>
+  <ol id="steps"></ol>
+</section>
+
+<p class="small">Routing: OpenStreetMap bike profile. Places: Nominatim. Don't operate this while riding; set the route first.</p>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CHAR    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const $ = id => document.getElementById(id);
+
+let map, routeLayer, posMarker;
+let coords = [], cum = [], steps = [], stepAlong = [], total = 0;
+let bleChar = null, lastSent = '', lastSentAt = 0;
+let simTimer = null, simAlong = 0, watchId = null, lastAlong = 0, lastReroute = 0;
+let myPos = null, useMyPos = false, wakeLock = null;
+
+const GLYPH = {STR:'⬆', LFT:'⬅', RGT:'➡', SLL:'↖', SLR:'↗',
+               SHL:'↙', SHR:'↘', UTN:'↩', RBT:'⟳', ARR:'⚑'};
+
+function setStatus(t, err){ const s=$('status'); s.textContent=t||''; s.className=err?'err':''; }
+
+// ---------- map ----------
+map = L.map('map').setView([12.9716, 77.5946], 12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap'}).addTo(map);
+
+// ---------- geometry ----------
+function hav(a, b){
+  const R=6371000, rad=Math.PI/180;
+  const dLat=(b[1]-a[1])*rad, dLon=(b[0]-a[0])*rad;
+  const x=Math.sin(dLat/2)**2+Math.cos(a[1]*rad)*Math.cos(b[1]*rad)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(x));
+}
+function project(p, global){
+  const kx=111320*Math.cos(p.lat*Math.PI/180), ky=110540;
+  let best={dist:Infinity, along:0};
+  const lo = global ? 0 : lastAlong-200, hi = global ? Infinity : lastAlong+800;
+  for(let i=0;i<coords.length-1;i++){
+    if(cum[i+1]<lo) continue;
+    if(cum[i]>hi) break;
+    const ax=(coords[i][0]-p.lon)*kx, ay=(coords[i][1]-p.lat)*ky;
+    const bx=(coords[i+1][0]-p.lon)*kx, by=(coords[i+1][1]-p.lat)*ky;
+    const dx=bx-ax, dy=by-ay, len2=dx*dx+dy*dy;
+    let t = len2 ? -(ax*dx+ay*dy)/len2 : 0; t=Math.max(0,Math.min(1,t));
+    const cx=ax+t*dx, cy=ay+t*dy, d=Math.hypot(cx,cy);
+    if(d<best.dist) best={dist:d, along:cum[i]+t*(cum[i+1]-cum[i])};
+  }
+  if(!global && best.dist>80) return project(p, true);
+  return best;
+}
+function pointAt(along){
+  let lo=0, hi=cum.length-1;
+  while(lo<hi-1){ const m=(lo+hi)>>1; if(cum[m]<=along) lo=m; else hi=m; }
+  const seg=cum[hi]-cum[lo], t=seg?(along-cum[lo])/seg:0;
+  return {lon:coords[lo][0]+t*(coords[hi][0]-coords[lo][0]), lat:coords[lo][1]+t*(coords[hi][1]-coords[lo][1])};
+}
+
+// ---------- places and routing ----------
+async function resolvePlace(q){
+  const m = q.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if(m) return {lat:+m[1], lon:+m[2], name:q};
+  const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q='+encodeURIComponent(q));
+  const j = await r.json();
+  if(!j.length) throw new Error('Place not found: '+q);
+  return {lat:+j[0].lat, lon:+j[0].lon, name:j[0].display_name};
+}
+async function fetchRoute(a, b){
+  const url = `https://routing.openstreetmap.de/routed-bike/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?steps=true&overview=full&geometries=geojson`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if(j.code!=='Ok') throw new Error('No route found ('+j.code+')');
+  return j.routes[0];
+}
+function ascii(s){ return (s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^\x20-\x7E]/g,'').replace(/\|/g,' ').trim(); }
+
+function codeFor(st){
+  const t=st.maneuver.type, mod=st.maneuver.modifier||'';
+  if(t==='arrive') return 'ARR';
+  if(t==='roundabout' || t==='rotary') return 'RBT';
+  const map={'uturn':'UTN','sharp left':'SHL','left':'LFT','slight left':'SLL','straight':'STR','slight right':'SLR','right':'RGT','sharp right':'SHR'};
+  return map[mod] || 'STR';
+}
+function words(st){
+  const c=codeFor(st), n=st.name?(' onto '+st.name):'';
+  return ({STR:'Continue straight',LFT:'Turn left',RGT:'Turn right',SLL:'Bear left',SLR:'Bear right',
+           SHL:'Sharp left',SHR:'Sharp right',UTN:'Make a U-turn',RBT:'Enter the roundabout',ARR:'Arrive'}[c]) + (c==='ARR'?'':n);
+}
+
+function loadRoute(r){
+  coords = r.geometry.coordinates;
+  cum = [0];
+  for(let i=1;i<coords.length;i++) cum.push(cum[i-1]+hav(coords[i-1],coords[i]));
+  total = cum[cum.length-1];
+  steps = r.legs.flatMap(l=>l.steps);
+  stepAlong = []; let idx=0;
+  for(const st of steps){
+    const loc=st.maneuver.location; let bi=idx, bd=Infinity;
+    for(let i=idx;i<coords.length;i++){ const d=hav(loc,coords[i]); if(d<bd){bd=d;bi=i;} if(d>bd+300) break; }
+    idx=bi; stepAlong.push(cum[bi]);
+  }
+  if(routeLayer) map.removeLayer(routeLayer);
+  routeLayer = L.polyline(coords.map(c=>[c[1],c[0]]), {weight:5}).addTo(map);
+  map.fitBounds(routeLayer.getBounds(), {padding:[20,20]});
+  $('steps').innerHTML = steps.map(s=>`<li>${words(s)} &mdash; ${Math.round(s.distance)} m</li>`).join('');
+  $('btnStart').disabled = false;
+  lastAlong = 0;
+}
+
+// ---------- instruction logic ----------
+function showAndSend(along){
+  let i=0;
+  while(i+1<steps.length && stepAlong[i+1] <= along+5) i++;
+  let code, dist, street;
+  if(i>=steps.length-1){ code='ARR'; dist=Math.max(0,total-along); street='Destination'; }
+  else {
+    const nxt=steps[i+1];
+    code=codeFor(nxt);
+    dist=Math.max(0,stepAlong[i+1]-along);
+    street=ascii(nxt.name) || (code==='ARR'?'Destination':'');
+  }
+  const q = dist>=1000 ? Math.round(dist/100)*100 : dist>=100 ? Math.round(dist/10)*10 : Math.round(dist/5)*5;
+  $('arrow').textContent = GLYPH[code]||'?';
+  $('dist').textContent = q>=1000 ? (q/1000).toFixed(1)+' km' : q+' m';
+  $('street').textContent = street || '(unnamed road)';
+  $('progress').textContent = `Done ${(along/1000).toFixed(2)} km of ${(total/1000).toFixed(2)} km`;
+  send(`${code}|${q}|${street.slice(0,38)}`);
+}
+
+// ---------- bluetooth ----------
+function setBle(t){ $('bleState').textContent=t; }
+async function connectBle(){
+  if(!navigator.bluetooth){
+    $('bleHint').textContent = 'This browser has no Web Bluetooth. On PC use Chrome or Edge; on iPhone use the Bluefy app.';
+    return;
+  }
+  try{
+    const dev = await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    dev.addEventListener('gattserverdisconnected', ()=>{ bleChar=null; setBle('Disconnected'); });
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SERVICE);
+    bleChar = await svc.getCharacteristic(CHAR);
+    setBle('Connected: '+(dev.name||'BikeNav'));
+    lastSent='';
+  }catch(e){ setBle('Not connected'); $('bleHint').textContent=String(e.message||e); }
+}
+async function send(msg){
+  const now=Date.now();
+  if(!bleChar || msg===lastSent || now-lastSentAt<350) return;
+  lastSent=msg; lastSentAt=now;
+  const data=new TextEncoder().encode(msg);
+  try{
+    if(bleChar.writeValueWithoutResponse) await bleChar.writeValueWithoutResponse(data);
+    else await bleChar.writeValue(data);
+  }catch(e){ $('bleHint').textContent='Send failed: '+(e.message||e); }
+}
+
+// ---------- run ----------
+function stopNav(){
+  if(simTimer){ clearInterval(simTimer); simTimer=null; }
+  if(watchId!==null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+  if(wakeLock){ try{wakeLock.release();}catch(e){} wakeLock=null; }
+  $('btnStop').disabled=true; $('btnStart').disabled=!steps.length;
+}
+function setMarker(p){
+  if(!posMarker) posMarker=L.circleMarker([p.lat,p.lon],{radius:8}).addTo(map);
+  else posMarker.setLatLng([p.lat,p.lon]);
+}
+async function startNav(){
+  if(!steps.length) return;
+  stopNav();
+  $('btnStart').disabled=true; $('btnStop').disabled=false;
+  try{ wakeLock = await navigator.wakeLock?.request('screen'); }catch(e){}
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  if(mode==='sim'){
+    simAlong=0; let last=Date.now();
+    simTimer=setInterval(()=>{
+      const now=Date.now(), dt=(now-last)/1000; last=now;
+      simAlong=Math.min(total, simAlong+(+$('speed').value)*dt);
+      setMarker(pointAt(simAlong)); showAndSend(simAlong);
+      if(simAlong>=total){ clearInterval(simTimer); simTimer=null; $('btnStop').disabled=true; $('btnStart').disabled=false; }
+    },500);
+  } else {
+    if(!navigator.geolocation){ setStatus('No GPS available in this browser.', true); stopNav(); return; }
+    watchId=navigator.geolocation.watchPosition(async pos=>{
+      const p={lat:pos.coords.latitude, lon:pos.coords.longitude};
+      setMarker(p);
+      const pr=project(p,false);
+      if(pr.dist>80){
+        if(Date.now()-lastReroute>15000){
+          lastReroute=Date.now(); setStatus('Off route, finding a new route...');
+          try{ const dest=coords[coords.length-1]; loadRoute(await fetchRoute({lat:p.lat,lon:p.lon},{lat:dest[1],lon:dest[0]})); setStatus('New route ready.'); }
+          catch(e){ setStatus(String(e.message||e), true); }
+        }
+        return;
+      }
+      lastAlong=pr.along; showAndSend(pr.along);
+    }, err=>setStatus('GPS error: '+err.message, true), {enableHighAccuracy:true, maximumAge:1000, timeout:15000});
+  }
+}
+
+// ---------- wiring ----------
+$('speed').addEventListener('input', e=>$('speedVal').textContent=e.target.value);
+$('btnBle').addEventListener('click', connectBle);
+$('btnStart').addEventListener('click', startNav);
+$('btnStop').addEventListener('click', stopNav);
+$('btnMyLoc').addEventListener('click', ()=>{
+  if(!navigator.geolocation){ setStatus('No GPS available here.', true); return; }
+  setStatus('Getting your location...');
+  navigator.geolocation.getCurrentPosition(p=>{
+    myPos={lat:p.coords.latitude, lon:p.coords.longitude}; useMyPos=true;
+    $('from').value=`${myPos.lat.toFixed(5)}, ${myPos.lon.toFixed(5)}`; setStatus('Start set to your location.');
+  }, e=>setStatus('Location error: '+e.message, true), {enableHighAccuracy:true, timeout:15000});
+});
+$('btnRoute').addEventListener('click', async ()=>{
+  stopNav(); setStatus('Finding route...'); $('btnRoute').disabled=true;
+  try{
+    const a=await resolvePlace($('from').value), b=await resolvePlace($('to').value);
+    const r=await fetchRoute(a,b);
+    loadRoute(r);
+    setStatus(`Route ready: ${(r.distance/1000).toFixed(1)} km, about ${Math.round(r.duration/60)} min by bike.`);
+  }catch(e){ setStatus(String(e.message||e), true); }
+  $('btnRoute').disabled=false;
+});
+</script>
+</body>
+</html>
